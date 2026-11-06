@@ -4,48 +4,37 @@ const http = require('http');
 const PORT = process.env.PORT || 9090;
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'online', service: 'openxill-core-proxy' }));
+    res.end(JSON.stringify({ status: 'online', service: 'openxill-core-relay' }));
 });
 
 const wss = new WebSocket.Server({ server });
 const rooms = new Map();
-const nodeRegistry = new Map();
 
-function broadcastPoolState(roomCode) {
+function broadcastToRoom(roomCode, message, senderWs) {
     const clients = rooms.get(roomCode);
-    if (!clients || clients.size === 0) return;
-
-    let totalRamMb = 0;
-    let nodeCount = 0;
-
+    if (!clients) return;
     for (const client of clients) {
-        const stats = nodeRegistry.get(client);
-        if (stats) {
-            totalRamMb += stats.ramMb || 0;
-            nodeCount++;
+        if (client !== senderWs && client.readyState === WebSocket.OPEN) {
+            client.send(message);
         }
     }
+}
 
-    const payload = JSON.stringify({
-        type: 'pool_update',
-        room: roomCode,
-        totalRamMb: totalRamMb,
-        nodeCount: nodeCount,
-        timestamp: Date.now()
-    });
-
-    for (const client of clients) {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(payload);
+function updatePeerCount(roomCode) {
+    const clients = rooms.get(roomCode);
+    const count = clients ? clients.size : 0;
+    const msg = JSON.stringify({ type: 'peer_status', count: count });
+    if (clients) {
+        for (const client of clients) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(msg);
+            }
         }
     }
 }
 
 wss.on('connection', (ws) => {
     let currentRoom = null;
-
-    ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (message) => {
         try {
@@ -57,54 +46,24 @@ wss.on('connection', (ws) => {
                     rooms.set(currentRoom, new Set());
                 }
                 rooms.get(currentRoom).add(ws);
-
-                if (data.ramMb) {
-                    nodeRegistry.set(ws, { ramMb: Number(data.ramMb) || 0 });
-                }
-
-                broadcastPoolState(currentRoom);
-            } else if (data.type === 'telemetry') {
-                if (currentRoom) {
-                    nodeRegistry.set(ws, { ramMb: Number(data.ramMb) || 0 });
-                    broadcastPoolState(currentRoom);
-                }
+                updatePeerCount(currentRoom);
             } else if (data.type === 'packet' && currentRoom) {
-                const clients = rooms.get(currentRoom);
-                if (clients) {
-                    for (const client of clients) {
-                        if (client !== ws && client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify(data));
-                        }
-                    }
-                }
+                broadcastToRoom(currentRoom, JSON.stringify(data), ws);
             }
         } catch (e) {}
     });
 
     ws.on('close', () => {
-        nodeRegistry.delete(ws);
         if (currentRoom && rooms.has(currentRoom)) {
             const roomSet = rooms.get(currentRoom);
             roomSet.delete(ws);
             if (roomSet.size === 0) {
                 rooms.delete(currentRoom);
             } else {
-                broadcastPoolState(currentRoom);
+                updatePeerCount(currentRoom);
             }
         }
     });
-});
-
-const interval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 25000);
-
-wss.on('close', () => {
-    clearInterval(interval);
 });
 
 server.listen(PORT);
